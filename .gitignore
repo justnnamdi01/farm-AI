@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (if too large, use Git LFS)
+# Uncomment if model is >100MB:
+# *.pt
+# *.pth
+
+# Data (excluded - too large for GitHub. Download dataset separately)
+data/train/
+data/val/
+data/test/
+
+# Results (optional)
+# results/
+
+# Temporary files
+*.tmp
+*.log
+temp/
+

@@ -1,0 +1,47 @@
+model:
+  architecture: "mobilenet_v3_small"
+  num_classes: 6        # 6 classes: fresh_apples, rotten_apples, fresh_bananas, fresh_oranges, fresh_mango, fresh_peach
+  input_size: 224       # 224 or 320 (224 recommended for RPi4 speed)
+  pretrained: true
+
+train:
+  data_root: "data"
+  train_dir: "train"
+  val_dir: "val"
+  batch_size: 32
+  num_workers: 4
+  epochs: 8
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  device: "cpu"        # use CPU on laptop unless you have a GPU
+  output_dir: "checkpoints"
+
+eval:
+  test_dir: "test"
+  results_dir: "results"
+
+runtime:
+  device: "cpu"           # override at CLI if needed
+  camera_index: 0
+  min_confidence: 0.6
+  fps_target: 5
+  display: true
+  manual_trigger: false   # if true, press SPACE to trigger robot command (good for presentation)
+
+distance_pose:
+  fruit_diameter_m: 0.08     # approximate diameter, adjust per fruit
+  focal_length_px: 800.0     # estimate via calibration
+  camera_to_robot_transform: # 4x4 matrix (row-major) camera->robot base
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+
+robot:
+  enable_motion: true         # Set to false to only print commands (safe testing)
+  sdk_type: "auto"           # "auto" (detect), "arm_lib" (Yahboom), "servo" (PCA9685), "mock" (print only)
+  home_position: [0.15, 0.0, 0.20]      # Safe home position (x, y, z in meters)
+  green_bag_position: [0.25, 0.10, 0.10]  # Where to place fresh fruits (x, y, z in meters)
+  red_bag_position: [0.25, -0.10, 0.10]   # Where to place rotten fruits (x, y, z in meters)
+
+
