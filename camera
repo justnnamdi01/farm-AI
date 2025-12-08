@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+
+import cv2
+import threading
+import queue
+import time
+import os
+import glob
+from pathlib import Path
+try:
+    from Arm_Lib import Arm_Device
+except Exception:
+    # Fallback mock for environments without Arm_Lib (e.g., development or CI)
+    class Arm_Device:
+        def __init__(self, *args, **kwargs):
+            print("[ARM] Mock Arm_Device initialized (no hardware).")
+
+        def Arm_serial_servo_write(self, servo_id, position, time_ms):
+            print(f"[ARM] Mock: servo {servo_id} -> pos {position} (time {time_ms})")
+
+        def __del__(self):
+            print("[ARM] Mock Arm_Device destroyed")
+import tkinter as tk
+from tkinter import Label
+from PIL import Image, ImageTk
+
+from ultralytics import YOLO
+
+# Initialize the robotic arm (DOFBOT)
+Arm = Arm_Device()
+time.sleep(0.1)  # Allow the arm to initialize properly
+
+# Load YOLO model for fruit classification (edible vs rotten)
+# Make sure 'best.pt' is in the working directory or provide an absolute path.
+try:
+    # Ensure MODEL_PATH is defined (in case config section is not yet executed)
+    if 'MODEL_PATH' not in globals():
+        MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
+
+    fruit_model = YOLO(MODEL_PATH)
+    print(f"[VISION] Loaded YOLO model '{MODEL_PATH}' for fruit sorting")
+except Exception as e:
+    fruit_model = None
+    print(f"[VISION] WARNING: Could not load YOLO model '{MODEL_PATH}': {e}")
+
+# Configuration: Set to 'camera' or 'files'
+# Default to camera; allow overrides via environment variables:
+#   INPUT_MODE (camera|files), SAMPLE_IMAGES_FOLDER, MODEL_PATH, CAMERA_INDEX
+INPUT_MODE = os.environ.get("INPUT_MODE", "camera")
+SAMPLE_IMAGES_FOLDER = os.environ.get("SAMPLE_IMAGES_FOLDER", "sample_images")
+MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
+CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
+
+# Arm movement functions
+def arm_clamp_block(enable):
+    """
+    Controls the robotic arm clamp to either hold or release an object.
+    Args:
+        enable (int): 1 to clamp, 0 to release.
+    """
+    position = 100 if enable else 10
+    Arm.Arm_serial_servo_write(6, position, 400)
+    time.sleep(0.5)
+
+def arm_move(positions, s_time=500):
+    """
+    Moves the robotic arm to specified positions.
+    Args:
+        positions (list): List of positions for the arm's servos.
+        s_time (int): Duration of the movement in milliseconds.
+    """
+    for i, pos in enumerate(positions):
+        servo_id = i + 1
+        # Adjust timing for specific servos if necessary
+        adjusted_time = (
+            int(s_time * 1.2) if servo_id == 5 else
+            int(3 * s_time / 4) if servo_id == 1 else
+            int(s_time)
+        )
+        Arm.Arm_serial_servo_write(servo_id, pos, adjusted_time)
+        time.sleep(0.01)
+    time.sleep(s_time / 1000)
+
+# Predefined arm positions
+p_front = [90, 75, 0, 30, 90]
+p_right = [0, 75, 0, 30, 90]
+p_right_top = [0, 75, 0, 60, 90]
+p_left_top = [180, 75, 0, 60, 90]
+p_left = [180, 75, 0, 30, 90]
+p_top = [90, 80, 50, 50, 90]
+p_rest = [90, 90, 0, 5, 90]
+
+# Queue lock to ensure thread-safe operations
+queue_lock = threading.Lock()
+
+def move_object(target, processing_event, producer_allowed_event):
+    """
+    Moves an object to the specified target location (left or right).
+    Args:
+        target (str): 'left' or 'right'.
+        processing_event (threading.Event): Event to control processing flow.
+        producer_allowed_event (threading.Event): Event to control frame capturing.
+    """
+    processing_event.clear()
+    producer_allowed_event.clear()
+    try:
+        if target not in ['left', 'right']:
+            print("Invalid target! Use 'left' or 'right'.")
+            return
+
+        # Pick up the object
+        arm_clamp_block(0)  # Release to prepare for pickup
+        arm_move(p_front, 1000)
+        arm_clamp_block(1)  # Clamp the object
+        arm_move(p_top, 1000)  # Lift the object
+
+        # Move to the target
+        if target == 'left':
+            arm_move(p_left, 1000)
+            arm_clamp_block(0)  # Release object
+            arm_move(p_left_top, 500)
+        elif target == 'right':
+            arm_move(p_right, 1000)
+            arm_clamp_block(0)  # Release object
+            arm_move(p_right_top, 500)
+
+        # Return to the rest position
+        arm_move(p_top, 1000)
+        arm_move(p_rest, 1000)
+    except Exception as e:
+        print(f"Error during arm movement: {e}")
+    finally:
+        producer_allowed_event.set()
+        processing_event.set()
+
+def is_edible_label(label: str) -> bool:
+    """
+    Decide if a detection label corresponds to an edible fruit.
+
+    Adjust this logic to match your trained model's class names
+    (for example: 'fresh_apple', 'rotten_apple', etc.).
+    """
+    l = label.lower()
+    # Anything explicitly marked rotten/bad is treated as non-edible
+    if any(word in l for word in ["rotten", "bad", "mold", "mould", "decay", "spoiled", "bruise"]):
+        return False
+    # Otherwise assume it's edible
+    return True
+
+
+def detect_fruits(frame, conf_threshold: float = 0.5):
+    """
+    Run the YOLO model on the current frame and return detections.
+
+    Each detection is a dict with:
+        - label: class name
+        - confidence: float
+        - center: (cx, cy) in image pixels
+        - bbox: (x1, y1, x2, y2)
+    """
+    if fruit_model is None:
+        print("[VISION] YOLO model not available, skipping detection")
+        return []
+
+    # YOLO from ultralytics accepts numpy array (BGR) directly
+    results = fruit_model(
+        frame,
+        conf=conf_threshold,
+        verbose=False,
+    )
+
+    detections = []
+    if not results:
+        return detections
+
+    result = results[0]
+    if not hasattr(result, "boxes") or result.boxes is None:
+        return detections
+
+    boxes = result.boxes
+    for box in boxes:
+        # Confidence
+        if hasattr(box, "conf"):
+            conf = float(box.conf[0])
+        else:
+            conf = 1.0
+
+        if conf < conf_threshold:
+            continue
+
+        # Class / label
+        cls_id = int(box.cls[0]) if hasattr(box, "cls") else 0
+        label = fruit_model.names.get(cls_id, str(cls_id)) if hasattr(fruit_model, "names") else str(cls_id)
+
+        # Bounding box and center
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+        detections.append(
+            {
+                "label": label,
+                "confidence": conf,
+                "center": (cx, cy),
+                "bbox": (x1, y1, x2, y2),
+            }
+        )
+
+    return detections
+
+def process_frames(frame_queue_container, processing_event, producer_allowed_event, rotten_count, edible_count):
+    """
+    Processes frames from the queue to detect fruits and sort them.
+
+    - Uses YOLO (`best.pt`) to detect fruits.
+    - Classifies detection as edible or rotten.
+    - Moves edible fruits to the RIGHT, rotten fruits to the LEFT.
+
+    Args:
+        frame_queue_container (list): Container holding the frame queue.
+        processing_event (threading.Event): Event to control processing flow.
+        producer_allowed_event (threading.Event): Event to control frame capturing.
+        rotten_count (tk.IntVar): Counter for rotten fruits.
+        edible_count (tk.IntVar): Counter for edible fruits.
+    """
+    while True:
+        processing_event.wait()
+        with queue_lock:
+            current_queue = frame_queue_container[0]
+
+        if not current_queue.empty():
+            frame = current_queue.get()
+            detections = detect_fruits(frame)
+
+            if not detections:
+                continue
+
+            # Pick the highest-confidence detection
+            detections.sort(key=lambda d: d["confidence"], reverse=True)
+            best_det = detections[0]
+
+            label = best_det["label"]
+            conf = best_det["confidence"]
+            (cx, cy) = best_det["center"]
+
+            print(
+                f"[VISION] Detected '{label}' (conf={conf:.2f}) "
+                f"at image coords x={cx:.1f}, y={cy:.1f}"
+            )
+
+            # Decide target bin based on label: RIGHT for edible, LEFT for rotten
+            if is_edible_label(label):
+                target = "right"
+                print("[SORT] Fruit classified as EDIBLE → moving RIGHT bin")
+                edible_count.set(edible_count.get() + 1)
+            else:
+                target = "left"
+                print("[SORT] Fruit classified as ROTTEN → moving LEFT bin")
+                rotten_count.set(rotten_count.get() + 1)
+
+            # Pause frame production while the arm is moving to avoid
+            # acting on the same object multiple times.
+            producer_allowed_event.clear()
+            processing_event.clear()
+            with queue_lock:
+                frame_queue_container[0] = queue.Queue(maxsize=10)
+
+            move_object(target, processing_event, producer_allowed_event)
+
+def get_image_files(folder_path):
+    """
+    Get all image files from the specified folder.
+    Supports common image formats: jpg, jpeg, png, bmp, tiff, webp
+    """
+    if not os.path.exists(folder_path):
+        print(f"[FILES] Folder '{folder_path}' does not exist. Creating it...")
+        os.makedirs(folder_path, exist_ok=True)
+        return []
+    
+    extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.webp']
+    image_files = []
+    for ext in extensions:
+        image_files.extend(glob.glob(os.path.join(folder_path, ext)))
+        image_files.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+    
+    return sorted(image_files)
+
+
+def capture_frames(cap, frame_queue_container, producer_allowed_event, input_mode="camera", image_folder=None):
+    """
+    Continuously captures frames from camera or loads images from folder.
+    Args:
+        cap: OpenCV VideoCapture object (None if using files).
+        frame_queue_container (list): Container holding the frame queue.
+        producer_allowed_event (threading.Event): Event to control frame capturing.
+        input_mode: "camera" or "files"
+        image_folder: Path to folder containing images (if input_mode == "files")
+    """
+    if input_mode == "files":
+        # Process images from folder
+        if image_folder is None:
+            image_folder = SAMPLE_IMAGES_FOLDER
+        
+        image_files = get_image_files(image_folder)
+        if not image_files:
+            print(f"[FILES] No images found in '{image_folder}'. Add images to this folder.")
+            return
+        
+        print(f"[FILES] Found {len(image_files)} images in '{image_folder}'")
+        image_index = 0
+        
+        while True:
+            producer_allowed_event.wait()
+            
+            if image_index >= len(image_files):
+                print("[FILES] All images processed. Restarting from beginning...")
+                image_index = 0
+                time.sleep(2)  # Pause before restarting
+                continue
+            
+            image_path = image_files[image_index]
+            frame = cv2.imread(image_path)
+            
+            if frame is None:
+                print(f"[FILES] Failed to load image: {image_path}")
+                image_index += 1
+                continue
+            
+            print(f"[FILES] Processing image {image_index + 1}/{len(image_files)}: {os.path.basename(image_path)}")
+            
+            with queue_lock:
+                current_queue = frame_queue_container[0]
+                if current_queue.full():
+                    try:
+                        current_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                current_queue.put(frame)
+            
+            image_index += 1
+            time.sleep(1.0)  # Wait 1 second between images
+    
+    else:
+        # Process frames from camera
+        while True:
+            producer_allowed_event.wait()
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame")
+                break
+
+            with queue_lock:
+                current_queue = frame_queue_container[0]
+                if current_queue.full():
+                    try:
+                        current_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                current_queue.put(frame)
+            time.sleep(0.1)
+
+def main():
+    """
+    Main function to initialize the system and GUI.
+    """
+    # Determine input mode
+    input_mode = INPUT_MODE.lower()
+    cap = None
+    current_frame = None
+    
+    if input_mode == "camera":
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            print("Cannot open camera")
+            return
+    else:
+        # File mode - check if folder exists and has images
+        image_files = get_image_files(SAMPLE_IMAGES_FOLDER)
+        if not image_files:
+            print(f"[INFO] No images found in '{SAMPLE_IMAGES_FOLDER}'. Add images to this folder.")
+            print(f"[INFO] You can still start the program, but no frames will be processed until images are added.")
+        else:
+            print(f"[INFO] Found {len(image_files)} images in '{SAMPLE_IMAGES_FOLDER}'")
+
+    root = tk.Tk()
+    root.title("Fruit Sorter Control Panel")
+    root.configure(bg="#2e2e2e")
+
+    video_label = Label(root, bg="#2e2e2e")
+    video_label.pack()
+
+    # Display current input mode
+    mode_label = tk.Label(
+        root, 
+        text=f"Mode: {input_mode.upper()}", 
+        font=("Comfortaa", 10), 
+        bg="#2e2e2e", 
+        fg="yellow"
+    )
+    mode_label.pack()
+    
+    if input_mode == "files":
+        folder_label = tk.Label(
+            root, 
+            text=f"Folder: {SAMPLE_IMAGES_FOLDER}", 
+            font=("Comfortaa", 9), 
+            bg="#2e2e2e", 
+            fg="lightgray"
+        )
+        folder_label.pack()
+
+    rotten_count = tk.IntVar(value=0)
+    edible_count = tk.IntVar(value=0)
+
+    rotten_label = tk.Label(root, textvariable=rotten_count, font=("Comfortaa", 14), fg="red", bg="#2e2e2e")
+    rotten_label.pack()
+    tk.Label(root, text="Rotten Fruits (LEFT bin)", font=("Comfortaa", 12), bg="#2e2e2e", fg="white").pack()
+
+    edible_label = tk.Label(root, textvariable=edible_count, font=("Comfortaa", 14), fg="green", bg="#2e2e2e")
+    edible_label.pack()
+    tk.Label(root, text="Edible Fruits (RIGHT bin)", font=("Comfortaa", 12), bg="#2e2e2e", fg="white").pack()
+
+    frame_queue_container = [queue.Queue(maxsize=10)]
+    processing_event = threading.Event()
+    producer_allowed_event = threading.Event()
+
+    producer_thread = None
+    consumer_thread = None
+
+    def start_program():
+        """
+        Starts the frame capture and processing threads.
+        """
+        nonlocal producer_thread, consumer_thread
+        processing_event.set()
+        producer_allowed_event.set()
+
+        if producer_thread is None or not producer_thread.is_alive():
+            producer_thread = threading.Thread(
+                target=capture_frames, 
+                args=(cap, frame_queue_container, producer_allowed_event, input_mode, SAMPLE_IMAGES_FOLDER)
+            )
+            producer_thread.daemon = True
+            producer_thread.start()
+
+        if consumer_thread is None or not consumer_thread.is_alive():
+            consumer_thread = threading.Thread(
+                target=process_frames,
+                args=(frame_queue_container, processing_event, producer_allowed_event, rotten_count, edible_count),
+            )
+            consumer_thread.daemon = True
+            consumer_thread.start()
+
+    def stop_program():
+        """
+        Stops the frame capture and processing threads.
+        """
+        producer_allowed_event.clear()
+        processing_event.clear()
+
+    def update_frame():
+        """
+        Updates the GUI with the latest video frame from camera or current image.
+        """
+        nonlocal current_frame
+        
+        if input_mode == "camera" and cap is not None:
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                current_frame = frame
+        elif input_mode == "files":
+            # Try to get the latest frame from queue for display
+            with queue_lock:
+                current_queue = frame_queue_container[0]
+                if not current_queue.empty():
+                    try:
+                        frame_bgr = current_queue.queue[-1]  # Get last frame without removing
+                        frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        current_frame = frame
+                    except:
+                        pass
+        
+        if current_frame is not None:
+            img = Image.fromarray(current_frame)
+            imgtk = ImageTk.PhotoImage(image=img)
+            video_label.imgtk = imgtk
+            video_label.configure(image=imgtk)
+        
+        root.after(100, update_frame)  # Update every 100ms
+
+    # Buttons for controlling the program
+    button_frame = tk.Frame(root, bg="#2e2e2e")
+    button_frame.pack(pady=10)
+
+    start_button = tk.Button(button_frame, text="Start", command=start_program, bg="#4caf50", fg="white", font=("Comfortaa", 12))
+    start_button.grid(row=0, column=0, padx=10)
+
+    stop_button = tk.Button(button_frame, text="Stop", command=stop_program, bg="#f44336", fg="white", font=("Comfortaa", 12))
+    stop_button.grid(row=0, column=1, padx=10)
+
+    update_frame()
+    root.mainloop()
+    
+    if cap is not None:
+        cap.release()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        del Arm
+        print("Program Ended")
+    
