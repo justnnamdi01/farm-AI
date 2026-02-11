@@ -1,4 +1,4 @@
-## Agricultural Fruit Harvester – Vision System (Coursework)
+## Agricultural Fruit Harvester – Vision System
 
 This project implements a **vision-based fruit sorting system** for an agricultural harvester using a **Raspberry Pi / Jetson + Dofbot robotic arm**.  
 The system classifies **fresh vs rotten fruits** (and optionally multiple fruit types) in **real time (>5 FPS at 224–320 px)** and supports:
